@@ -243,7 +243,39 @@ public partial class MainWindow : Window
 
             var period = GetDouble(PeriodDurationTextBox, 1.0) * GetTimeUnitFactor(PeriodUnitComboBox);
             var total = GetDouble(TotalDurationTextBox, period) * GetTimeUnitFactor(TotalDurationUnitComboBox);
+            var snapX = GetDouble(SnapXTextBox, 0.05) * GetTimeUnitFactor(SnapXUnitComboBox);
+
             var repeated = PwlFileService.BuildRepeatedWave(_points.ToList(), period, total);
+
+            repeated = RemoveRedundantDuplicatePoints(repeated);
+
+            if (TryFindDuplicateTimes(repeated, out int duplicateCount, out double firstDuplicateX))
+            {
+                double suggestedDelay = SuggestMinimalDelay(repeated, period, snapX);
+
+                var result = MessageBox.Show(
+                    this,
+                    $"Es wurden {duplicateCount} doppelte Zeitstempel erkannt.\n\n" +
+                    $"Erstes Vorkommen bei t = {firstDuplicateX.ToString("G6", CultureInfo.CurrentCulture)} s\n\n" +
+                    $"LTspice kann damit Probleme haben.\n" +
+                    $"Das entspricht meist einer ideal unendlich steilen Flanke.\n\n" +
+                    $"Vorgeschlagener Minimal-Delay: {suggestedDelay.ToString("G6", CultureInfo.CurrentCulture)} s\n\n" +
+                    $"Soll dieser Delay automatisch eingefügt werden?",
+                    "Doppelte Zeitstempel erkannt",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Warning);
+
+                if (result != MessageBoxResult.Yes)
+                {
+                    UpdateStatus("Export abgebrochen: doppelte Zeitstempel erkannt.");
+                    return;
+                }
+
+                repeated = ApplyMinimalDelayToDuplicateTimes(repeated, suggestedDelay);
+
+                if (TryFindDuplicateTimes(repeated, out _, out _))
+                    throw new InvalidOperationException("Doppelte Zeitstempel konnten nicht automatisch aufgelöst werden.");
+            }
 
             PwlFileService.Export(dialog.FileName, repeated);
             UpdateStatus($"PWL exportiert ({repeated.Count} Punkte).");
@@ -883,5 +915,138 @@ public partial class MainWindow : Window
         {
             e.Handled = true;
         }
+    }
+
+    private static List<WavePoint> RemoveRedundantDuplicatePoints(IEnumerable<WavePoint> points)
+    {
+        var ordered = points.OrderBy(p => p.X).ToList();
+        var result = new List<WavePoint>();
+
+        foreach (var point in ordered)
+        {
+            if (result.Count == 0)
+            {
+                result.Add(point.Clone());
+                continue;
+            }
+
+            var prev = result[^1];
+
+            if (TimesEqual(prev.X, point.X) && ValuesEqual(prev.Y, point.Y))
+                continue;
+
+            result.Add(point.Clone());
+        }
+
+        return result;
+    }
+
+    private static bool TryFindDuplicateTimes(IReadOnlyList<WavePoint> points, out int duplicateCount, out double firstDuplicateX)
+    {
+        duplicateCount = 0;
+        firstDuplicateX = 0.0;
+
+        for (int i = 1; i < points.Count; i++)
+        {
+            if (TimesEqual(points[i - 1].X, points[i].X))
+            {
+                duplicateCount++;
+
+                if (duplicateCount == 1)
+                    firstDuplicateX = points[i].X;
+            }
+        }
+
+        return duplicateCount > 0;
+    }
+
+    private static List<WavePoint> ApplyMinimalDelayToDuplicateTimes(IReadOnlyList<WavePoint> points, double baseDelay)
+    {
+        var result = points
+            .Select(p => p.Clone())
+            .OrderBy(p => p.X)
+            .ToList();
+
+        int i = 0;
+
+        while (i < result.Count)
+        {
+            int groupStart = i;
+            double baseX = result[groupStart].X;
+            int groupEnd = groupStart;
+
+            while (groupEnd + 1 < result.Count && TimesEqual(result[groupEnd + 1].X, baseX))
+                groupEnd++;
+
+            int groupSize = groupEnd - groupStart + 1;
+
+            if (groupSize > 1)
+            {
+                double localDelay = baseDelay;
+
+                if (groupEnd + 1 < result.Count)
+                {
+                    double nextDistinctX = result[groupEnd + 1].X;
+                    double availableWindow = nextDistinctX - baseX;
+
+                    if (availableWindow <= 0)
+                        throw new InvalidOperationException("Ungültige Punktreihenfolge beim Anwenden des Delays.");
+
+                    localDelay = Math.Min(localDelay, availableWindow / groupSize);
+                }
+
+                if (localDelay <= 0)
+                    throw new InvalidOperationException("Kein gültiger Minimal-Delay bestimmbar.");
+
+                for (int j = 1; j < groupSize; j++)
+                    result[groupStart + j].X = baseX + localDelay * j;
+            }
+
+            i = groupEnd + 1;
+        }
+
+        return result;
+    }
+
+    private static double SuggestMinimalDelay(IReadOnlyList<WavePoint> points, double period, double snapX)
+    {
+        var candidates = new List<double>();
+
+        if (snapX > 0)
+            candidates.Add(snapX / 10.0);
+
+        double minPositiveDx = double.PositiveInfinity;
+
+        for (int i = 1; i < points.Count; i++)
+        {
+            double dx = points[i].X - points[i - 1].X;
+            if (dx > 0 && dx < minPositiveDx)
+                minPositiveDx = dx;
+        }
+
+        if (!double.IsInfinity(minPositiveDx))
+            candidates.Add(minPositiveDx / 10.0);
+
+        if (period > 0)
+            candidates.Add(period / 1_000_000.0);
+
+        var delay = candidates
+            .Where(v => v > 0)
+            .DefaultIfEmpty(1e-12)
+            .Min();
+
+        return delay;
+    }
+
+    private static bool TimesEqual(double a, double b)
+    {
+        double scale = Math.Max(1.0, Math.Max(Math.Abs(a), Math.Abs(b)));
+        return Math.Abs(a - b) <= scale * 1e-12;
+    }
+
+    private static bool ValuesEqual(double a, double b)
+    {
+        double scale = Math.Max(1.0, Math.Max(Math.Abs(a), Math.Abs(b)));
+        return Math.Abs(a - b) <= scale * 1e-12;
     }
 }
